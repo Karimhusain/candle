@@ -20,7 +20,7 @@ INTERVALS = ["1h", "4h", "1d"] # Timeframes yang akan dipantau
 CANDLE_LIMIT = { # Batas candle yang diambil untuk analisis per interval
     "1h": 250,
     "4h": 150,
-    "1d": 100
+    "1d": 200
 }
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1392182015884787832/OwTMcZHCnm7mB16c7ebATXzgNWe7QmiXtmKPBvVu7YpdRdzAXIHhqSqp8ou9moKg64Tm" # <<< PENTING: GANTI DENGAN URL WEBHOOK DISCORD ANDA
 
