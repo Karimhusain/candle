@@ -22,7 +22,7 @@ CANDLE_LIMIT = { # Batas candle yang diambil untuk analisis per interval
     "4h": 200, # Diperluas
     "1d": 500 # Sangat diperluas untuk deteksi chart pattern dan SMC yang lebih baik
 }
-DISCORD_WEBHOOK = "" # <<< PENTING: GANTI DENGAN URL WEBHOOK DISCORD ANDA
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1392208407943184486/rTi7iaRdIKn_PW-_u2jZknXX4Dmty5m6kiKqttpueYsrpaj9pQi7-tYsSkAjqU3Dc6DM" # <<< PENTING: GANTI DENGAN URL WEBHOOK DISCORD ANDA
 
 # Frekuensi analisis real-time (dalam detik) untuk live candle dan fallback
 REAL_TIME_SCAN_INTERVAL_SECONDS = 30 * 60 # Setiap 30 menit
