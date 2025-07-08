@@ -19,8 +19,8 @@ SYMBOL = "BTCUSDT" # Ganti sesuai kebutuhan Anda, contoh: "ETHUSDT"
 INTERVALS = ["1h", "4h", "1d"] # Timeframes yang akan dipantau
 CANDLE_LIMIT = { # Batas candle yang diambil untuk analisis per interval
     "1h": 250,
-    "4h": 150,
-    "1d": 200
+    "4h": 200,
+    "1d": 200 # Disesuaikan agar cukup data untuk analisis 1D
 }
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1392182015884787832/OwTMcZHCnm7mB16c7ebATXzgNWe7QmiXtmKPBvVu7YpdRdzAXIHhqSqp8ou9moKg64Tm" # <<< PENTING: GANTI DENGAN URL WEBHOOK DISCORD ANDA
 
@@ -149,7 +149,6 @@ def get_time_progress(candle_open_time: datetime.datetime, interval_str: str) ->
     return elapsed_time / interval_sec
 
 # --- PRICE ACTION CANDLESTICK DETECTION ---
-# (Semua fungsi deteksi pola candlestick dari skrip sebelumnya tetap sama di sini)
 def is_bullish_engulfing(c1, c2, confirm_volume=False):
     if not (c1["close"] < c1["open"] and c2["close"] > c2["open"]): return False
     engulfs = c2["close"] > c1["open"] and c2["open"] < c1["close"] and \
@@ -329,7 +328,7 @@ def detect_double_top_bottom(candles: list) -> list:
         if h2_idx > h1_idx + 10 and abs(h1_price - h2_price) / h1_price < 0.01:
             valley_lows = [sl_price for sl_idx, sl_price in swing_lows if h1_idx < sl_idx < h2_idx]
             if valley_lows and candles[-1]["close"] < max(valley_lows) * 0.995:
-                patterns.append("Double Top (Potential Bearish Reversal)")
+                patterns.append("Double Top") # Hanya nama pola, deskripsi akan ditambahkan saat output
 
     if len(swing_lows) >= 2:
         l2_idx, l2_price = swing_lows[-1]
@@ -337,7 +336,7 @@ def detect_double_top_bottom(candles: list) -> list:
         if l2_idx > l1_idx + 10 and abs(l1_price - l2_price) / l1_price < 0.01:
             peak_highs = [sh_price for sh_idx, sh_price in swing_highs if l1_idx < sh_idx < l2_idx]
             if peak_highs and candles[-1]["close"] > min(peak_highs) * 1.005:
-                patterns.append("Double Bottom (Potential Bullish Reversal)")
+                patterns.append("Double Bottom") # Hanya nama pola, deskripsi akan ditambahkan saat output
     return patterns
 
 def detect_head_and_shoulders(candles: list) -> list:
@@ -357,7 +356,7 @@ def detect_head_and_shoulders(candles: list) -> list:
             if valley1_price > 0 and valley2_price > 0:
                 neckline_level = (valley1_price + valley2_price) / 2
                 if candles[-1]["close"] < neckline_level * 0.99 and candles[-2]["close"] > neckline_level: # Broke decisively
-                    patterns.append("Head & Shoulders (Potential Bearish Reversal)")
+                    patterns.append("Head & Shoulders") # Hanya nama pola, deskripsi akan ditambahkan saat output
 
     # Simplified Inverse Head & Shoulders
     if len(swing_lows) >= 3 and len(swing_highs) >= 2:
@@ -371,7 +370,7 @@ def detect_head_and_shoulders(candles: list) -> list:
             if peak1_price != float('inf') and peak2_price != float('inf'):
                 neckline_level = (peak1_price + peak2_price) / 2
                 if candles[-1]["close"] > neckline_level * 1.01 and candles[-2]["close"] < neckline_level:
-                    patterns.append("Inverse Head & Shoulders (Potential Bullish Reversal)")
+                    patterns.append("Inverse Head & Shoulders") # Hanya nama pola, deskripsi akan ditambahkan saat output
     return patterns
 
 def detect_chart_patterns(candles: list) -> list:
@@ -380,9 +379,6 @@ def detect_chart_patterns(candles: list) -> list:
     result.extend(detect_double_top_bottom(candles))
     result.extend(detect_head_and_shoulders(candles))
     # Placeholder for more complex pattern detections that require robust trend line detection
-    # result.extend(detect_triangles(candles)) 
-    # result.extend(detect_flags_wedges(candles)) 
-    # result.extend(detect_rectangle(candles)) 
     return result
 
 # --- SMART MONEY CONCEPTS (SMC - Dasar) ---
@@ -473,8 +469,8 @@ def get_multi_tf_confirmations(current_tf_patterns: list, all_tf_data: dict, cur
             elif higher_tf_trend == "Downtrend" and current_trend_main == "Downtrend":
                 confirmations.append(f"Tren turun selaras di {tf_name.upper()}")
             
-            is_bullish_pattern = any(p for p in current_tf_patterns if "Bullish" in p or "Hammer" in p or "Morning Star" in p)
-            is_bearish_pattern = any(p for p in current_tf_patterns if "Bearish" in p or "Shooting Star" in p or "Evening Star" in p)
+            is_bullish_pattern = any(p for p in current_tf_patterns if "Bullish" in p or "Hammer" in p or "Morning Star" in p or "Double Bottom" in p or "Inverse Head & Shoulders" in p)
+            is_bearish_pattern = any(p for p in current_tf_patterns if "Bearish" in p or "Shooting Star" in p or "Evening Star" in p or "Double Top" in p or "Head & Shoulders" in p)
 
             if is_bullish_pattern and higher_tf_trend == "Uptrend":
                 confirmations.append(f"Pola bullish di {current_tf_name.upper()} didukung tren Uptrend di {tf_name.upper()}")
@@ -483,44 +479,69 @@ def get_multi_tf_confirmations(current_tf_patterns: list, all_tf_data: dict, cur
             
     return confirmations
 
-def get_live_candle_potential_and_process(current_candle: dict) -> str:
-    """Menganalisis potensi awal dan proses perkembangan live candle."""
-    if current_candle["is_final_bar"]:
+def get_live_candle_potential_and_process(candle: dict) -> str:
+    """Menganalisis potensi awal dan proses perkembangan live candle dengan detail."""
+    if candle["is_final_bar"]:
         return "" # Hanya berlaku untuk live candle
 
-    open_price = current_candle["open"]
-    current_price = current_candle["close"]
-    high_price = current_candle["high"]
-    low_price = current_candle["low"]
+    open_price = candle["open"]
+    current_price = candle["close"]
+    high_price = candle["high"]
+    low_price = candle["low"]
 
-    message_parts = []
+    props = get_candle_properties(candle)
 
-    # Potensi Awal (berdasarkan posisi close relatif terhadap open)
+    potential_info = ""
+    process_info = ""
+    additional_info = [] # Untuk Perhatian dan Potensi Lanjut/Kondisi
+
+    # Potensi Awal (berdasarkan posisi close/current price relatif terhadap open)
     if current_price > open_price:
-        message_parts.append("Potensi Awal: **Bullish** 🟢 (harga saat ini di atas pembukaan).")
+        potential_info = "Potensi Awal: **Bullish** 🟢 (harga saat ini di atas pembukaan)."
     elif current_price < open_price:
-        message_parts.append("Potensi Awal: **Bearish** 🔴 (harga saat ini di bawah pembukaan).")
+        potential_info = "Potensi Awal: **Bearish** 🔴 (harga saat ini di bawah pembukaan)."
     else:
-        message_parts.append("Potensi Awal: **Netral** (harga saat ini dekat pembukaan).")
+        potential_info = "Potensi Awal: **Netral** ⚪ (harga saat ini di dekat pembukaan)."
 
-    # Proses Perkembangan (mengukur seberapa jauh dari high/low)
-    range_since_open = max(high_price, current_price) - min(low_price, current_price)
-    
-    if range_since_open > 0:
-        if (current_price - low_price) / range_since_open > 0.8:
-            message_parts.append("Proses: Harga dominan bergerak naik dari level terendah.")
-        elif (high_price - current_price) / range_since_open > 0.8:
-            message_parts.append("Proses: Harga dominan bergerak turun dari level tertinggi.")
+    # Proses Perkembangan dan Potensi Lanjut / Rejection
+    if props["is_bullish"]: # Candle sedang bullish (current_price > open_price)
+        if props["lower_shadow_to_range_ratio"] < 0.1: # Ekor bawah kecil
+            process_info = "Proses: Pembeli dominan mendorong harga naik dengan sedikit perlawanan awal."
+        elif props["lower_shadow_to_range_ratio"] > 0.2: # Ekor bawah signifikan
+            process_info = "Proses: Harga sempat turun namun didorong kuat naik oleh pembeli."
+            additional_info.append("Potensi tekanan beli kuat dari bawah (rejection dari low).")
         else:
-            message_parts.append("Proses: Pergerakan harga di tengah range.")
+            process_info = "Proses: Harga bergerak naik dari level terendah."
+        
+        # Potensi Lanjut Bullish (strong body, small upper shadow)
+        if props["body_to_range_ratio"] > 0.6 and props["upper_shadow_to_range_ratio"] < 0.2:
+            additional_info.append("Potensi Lanjut: **Momentum Bullish kuat** berlanjut.")
 
-    # Tambahan: Jika terjadi pantulan kuat dari High/Low
-    if (high_price - current_price) > 0.5 * (current_price - low_price) and (current_price < open_price):
-        message_parts.append("Perhatian: Potensi tekanan jual kuat dari atas.")
-    elif (current_price - low_price) > 0.5 * (high_price - current_price) and (current_price > open_price):
-        message_parts.append("Perhatian: Potensi tekanan beli kuat dari bawah.")
+    elif props["is_bearish"]: # Candle sedang bearish (current_price < open_price)
+        if props["upper_shadow_to_range_ratio"] < 0.1: # Ekor atas kecil
+            process_info = "Proses: Penjual dominan menekan harga turun dengan sedikit perlawanan awal."
+        elif props["upper_shadow_to_range_ratio"] > 0.2: # Ekor atas signifikan
+            process_info = "Proses: Harga sempat naik namun ditekan kuat turun oleh penjual."
+            additional_info.append("Potensi tekanan jual kuat dari atas (rejection dari high).")
+        else:
+            process_info = "Proses: Harga bergerak turun dari level tertinggi."
 
-    return " ".join(message_parts)
+        # Potensi Lanjut Bearish (strong body, small lower shadow)
+        if props["body_to_range_ratio"] > 0.6 and props["lower_shadow_to_range_ratio"] < 0.2:
+            additional_info.append("Potensi Lanjut: **Momentum Bearish kuat** berlanjut.")
+
+    else: # Doji-like atau body sangat kecil (current_price sangat dekat open_price)
+        process_info = "Proses: Harga bergerak bolak-balik, menunjukkan keraguan pasar."
+        if props["upper_shadow_to_range_ratio"] > 0.2 and props["lower_shadow_to_range_ratio"] > 0.2:
+            additional_info.append("Kondisi: **Sideways/Indecision** (tekanan beli dan jual seimbang).")
+        elif props["body_to_range_ratio"] < 0.1:
+            additional_info.append("Kondisi: **Keraguan/Konsolidasi** (pergerakan harga minimal).")
+
+    final_message_parts = [potential_info, process_info]
+    if additional_info:
+        final_message_parts.append("Perhatian: " + " ".join(additional_info))
+
+    return "💡 **Analisis Live Candle**: " + " ".join(final_message_parts)
 
 
 # --- MAIN LOGIC FOR PERIODIC SCAN ---
@@ -548,9 +569,17 @@ def scan_all_intervals_and_notify():
                  not current_candles_for_analysis[-1]["is_final_bar"]:
                 current_candles_for_analysis[-1] = live_candle_for_tf
         
-        if not current_candles_for_analysis or len(current_candles_for_analysis) < max(CANDLE_LIMIT.values()) / 2:
-            full_alert_message_parts.append(f"\n---\n📊 **{tf.upper()} Timeframe**: Tidak cukup data untuk analisis. ({len(current_candles_for_analysis)}/{max(CANDLE_LIMIT.values()) / 2} candles)")
-            continue
+        if not current_candles_for_analysis or len(current_candles_for_analysis) < CANDLE_LIMIT[tf]:
+            # Adjust minimum candle requirement based on what analysis needs for this TF
+            min_candles_needed = 3 # Basic PA needs 3, Chart patterns need more
+            if tf == "1d" and len(current_candles_for_analysis) < 100: # For daily, chart patterns need around 100+
+                 min_candles_needed = 100 
+            elif len(current_candles_for_analysis) < 50: # For other TFs, SMC/SR need about 50
+                 min_candles_needed = 50
+
+            if len(current_candles_for_analysis) < min_candles_needed:
+                full_alert_message_parts.append(f"\n---\n📊 **{tf.upper()} Timeframe**: Tidak cukup data untuk analisis. ({len(current_candles_for_analysis)}/{min_candles_needed} candles dibutuhkan)")
+                continue
 
         latest_candle = current_candles_for_analysis[-1]
         if current_price is None:
@@ -581,28 +610,59 @@ def scan_all_intervals_and_notify():
         status_candle_tag = "[C]" if latest_candle["is_final_bar"] else "[L]"
         status_candle_desc = "FINAL (Closed)" if latest_candle["is_final_bar"] else "LIVE (Open)"
         time_progress_info = ""
-        live_candle_potential_info = ""
+        live_candle_potential_info_msg = ""
+
+        # Detail candle (akan selalu ditampilkan untuk final/live)
+        candle_details = (
+            f"   • Open: `{latest_candle['open']:.2f}`\n"
+            f"   • High: `{latest_candle['high']:.2f}`\n"
+            f"   • Low: `{latest_candle['low']:.2f}`\n"
+            f"   • Close: `{latest_candle['close']:.2f}`\n"
+            f"   • Volume: `{latest_candle['volume']:.2f}`\n"
+            f"   • Body/Range Ratio: `{props['body_to_range_ratio']:.2f}`\n"
+            f"   • Upper Shadow/Range Ratio: `{props['upper_shadow_to_range_ratio']:.2f}`\n"
+            f"   • Lower Shadow/Range Ratio: `{props['lower_shadow_to_range_ratio']:.2f}`\n"
+        )
 
         if not latest_candle["is_final_bar"]:
             progress = get_time_progress(latest_candle["time"], tf)
             time_progress_info = f" ({int(progress*100)}% progress)"
-            live_candle_potential_info = get_live_candle_potential_and_process(latest_candle)
-            if live_candle_potential_info:
-                live_candle_potential_info = f"💡 **Analisis Live Candle**: {live_candle_potential_info}\n"
-
+            live_candle_potential_info_msg = get_live_candle_potential_and_process(latest_candle)
+            
         tf_msg_part = f"\n---\n📊 **{tf.upper()} Timeframe** {status_candle_tag} ({status_candle_desc}{time_progress_info})\n" \
-                      f"**Waktu Analisis**: {datetime.datetime.now(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n" \
-                      f"Waktu Pembukaan Candle: {latest_candle['time'].astimezone(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n" \
-                      f"Tipe Candle: {candle_type} (Range: {full_range_percent:.2f}%)\n" + \
-                      (live_candle_potential_info if not latest_candle["is_final_bar"] else "") # Hanya tampilkan untuk live candle
+                      f"**Waktu Analisis**: {datetime.datetime.now(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
+        
+        if latest_candle["is_final_bar"]:
+            tf_msg_part += f"**Waktu Penutupan Candle Sebelumnya**: {latest_candle['close_time'].astimezone(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
+        else:
+            tf_msg_part += f"Waktu Pembukaan Candle: {latest_candle['time'].astimezone(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
+
+
+        tf_msg_part += f"Tipe Candle: {candle_type} (Range: {full_range_percent:.2f}%)\n" \
+                       f"**Detail Candle (O/H/L/C)**:\n{candle_details}" + \
+                       (live_candle_potential_info_msg + "\n" if live_candle_potential_info_msg else "") # Tambah newline jika ada info live
 
         detected_info = False
         if pa_patterns: 
             tf_msg_part += "🕯️ **Pola Candlestick**: " + ", ".join(pa_patterns) + "\n"
             detected_info = True
-        if cp_patterns: 
-            tf_msg_part += "📈 **Pola Chart**: " + ", ".join(cp_patterns) + "\n"
+        
+        if cp_patterns:
+            cp_descriptions = []
+            for pattern in cp_patterns:
+                if "Double Top" in pattern:
+                    cp_descriptions.append(f"**Double Top**: Menunjukkan potensi pembalikan tren dari naik menjadi turun.")
+                elif "Double Bottom" in pattern:
+                    cp_descriptions.append(f"**Double Bottom**: Menunjukkan potensi pembalikan tren dari turun menjadi naik.")
+                elif "Head & Shoulders" in pattern:
+                    cp_descriptions.append(f"**Head & Shoulders**: Menunjukkan potensi pembalikan tren dari naik menjadi turun.")
+                elif "Inverse Head & Shoulders" in pattern:
+                    cp_descriptions.append(f"**Inverse Head & Shoulders**: Menunjukkan potensi pembalikan tren dari turun menjadi naik.")
+                else:
+                    cp_descriptions.append(pattern) # Untuk pola chart lain jika ada di masa depan
+            tf_msg_part += "📈 **Pola Chart**: " + "\n" + "\n".join([f"- {desc}" for desc in cp_descriptions]) + "\n"
             detected_info = True
+
         if bos_choch_patterns: 
             tf_msg_part += "🔄 **Struktur Pasar (SMC)**: " + ", ".join(bos_choch_patterns) + "\n"
             detected_info = True
@@ -627,7 +687,7 @@ def scan_all_intervals_and_notify():
             tf_msg_part += "✅ **Konfirmasi Multi-TF**: " + ", ".join(multi_tf_confirmations) + "\n"
             detected_info = True
         
-        if not detected_info and not live_candle_potential_info: # Only say "no patterns" if literally no info
+        if not detected_info and not live_candle_potential_info_msg: # Only say "no patterns" if literally no info
             tf_msg_part += "Tidak ada pola/informasi signifikan terdeteksi saat ini.\n"
 
         full_alert_message_parts.append(tf_msg_part)
@@ -717,21 +777,6 @@ def on_close(ws, close_status_code, close_msg):
     run_websocket_client()
 
 # --- RUNNER ---
-def run_websocket_client():
-    websocket.enableTrace(False) # Set to True for verbose WebSocket logging
-
-    ws_url = BINANCE_WS_URL
-    
-    ws = websocket.WebSocketApp(
-        ws_url,
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
-
-    ws.run_forever(ping_interval=60, ping_timeout=10) # Keep connection alive
-
 if __name__ == "__main__":
     if DISCORD_WEBHOOK == "<YOUR_DISCORD_WEBHOOK_HERE>":
         logger.error("ERROR: Variabel DISCORD_WEBHOOK belum diatur. Harap ganti placeholder dengan URL webhook Anda di awal skrip.")
