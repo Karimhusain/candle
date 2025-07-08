@@ -479,7 +479,7 @@ def get_multi_tf_confirmations(current_tf_patterns: list, all_tf_data: dict, cur
             
     return confirmations
 
-def get_live_candle_potential_and_process(candle: dict) -> str:
+def get_live_candle_potential_and_process(candle: dict, time_progress: float) -> str:
     """Menganalisis potensi awal dan proses perkembangan live candle dengan detail."""
     if candle["is_final_bar"]:
         return "" # Hanya berlaku untuk live candle
@@ -491,58 +491,67 @@ def get_live_candle_potential_and_process(candle: dict) -> str:
 
     props = get_candle_properties(candle)
 
-    potential_info = ""
-    process_info = ""
-    additional_info = [] # Untuk Perhatian dan Potensi Lanjut/Kondisi
+    potential_info = []
+    process_info = []
+    implication_info = [] # Untuk potensi pergerakan selanjutnya
 
-    # Potensi Awal (berdasarkan posisi close/current price relatif terhadap open)
+    # 1. Posisi Harga Saat Ini Relatif Terhadap Harga Pembukaan
     if current_price > open_price:
-        potential_info = "Potensi Awal: **Bullish** 🟢 (harga saat ini di atas pembukaan)."
+        potential_info.append("Potensi Awal: **Bullish** 🟢 (harga saat ini di atas pembukaan).")
     elif current_price < open_price:
-        potential_info = "Potensi Awal: **Bearish** 🔴 (harga saat ini di bawah pembukaan)."
+        potential_info.append("Potensi Awal: **Bearish** 🔴 (harga saat ini di bawah pembukaan).")
     else:
-        potential_info = "Potensi Awal: **Netral** ⚪ (harga saat ini di dekat pembukaan)."
+        potential_info.append("Potensi Awal: **Netral** ⚪ (harga saat ini di dekat pembukaan).")
 
-    # Proses Perkembangan dan Potensi Lanjut / Rejection
-    if props["is_bullish"]: # Candle sedang bullish (current_price > open_price)
-        if props["lower_shadow_to_range_ratio"] < 0.1: # Ekor bawah kecil
-            process_info = "Proses: Pembeli dominan mendorong harga naik dengan sedikit perlawanan awal."
-        elif props["lower_shadow_to_range_ratio"] > 0.2: # Ekor bawah signifikan
-            process_info = "Proses: Harga sempat turun namun didorong kuat naik oleh pembeli."
-            additional_info.append("Potensi tekanan beli kuat dari bawah (rejection dari low).")
-        else:
-            process_info = "Proses: Harga bergerak naik dari level terendah."
-        
-        # Potensi Lanjut Bullish (strong body, small upper shadow)
-        if props["body_to_range_ratio"] > 0.6 and props["upper_shadow_to_range_ratio"] < 0.2:
-            additional_info.append("Potensi Lanjut: **Momentum Bullish kuat** berlanjut.")
+    # 2. Analisis Body dan Shadows
+    if props["is_bullish"]:
+        process_info.append("Proses: Pembeli dominan mendorong harga naik.")
+        if props["lower_shadow_to_range_ratio"] > 0.2:
+            process_info.append(f"Ada penolakan kuat dari bawah (lower shadow {props['lower_shadow_to_range_ratio']:.1%} dari range).")
+            implication_info.append("Implikasi: Menunjukkan tekanan beli kuat di harga rendah, potensi kelanjutan naik.")
+        if props["upper_shadow_to_range_ratio"] > 0.2:
+            process_info.append(f"Ada penolakan dari atas (upper shadow {props['upper_shadow_to_range_ratio']:.1%} dari range).")
+            implication_info.append("Implikasi: Menunjukkan tekanan jual di harga tinggi, potensi pelemahan momentum naik.")
+        if props["body_to_range_ratio"] > 0.6:
+            implication_info.append("Implikasi: Momentum bullish kuat, berpotensi menjadi candle penentu tren.")
 
-    elif props["is_bearish"]: # Candle sedang bearish (current_price < open_price)
-        if props["upper_shadow_to_range_ratio"] < 0.1: # Ekor atas kecil
-            process_info = "Proses: Penjual dominan menekan harga turun dengan sedikit perlawanan awal."
-        elif props["upper_shadow_to_range_ratio"] > 0.2: # Ekor atas signifikan
-            process_info = "Proses: Harga sempat naik namun ditekan kuat turun oleh penjual."
-            additional_info.append("Potensi tekanan jual kuat dari atas (rejection dari high).")
-        else:
-            process_info = "Proses: Harga bergerak turun dari level tertinggi."
+    elif props["is_bearish"]:
+        process_info.append("Proses: Penjual dominan menekan harga turun.")
+        if props["upper_shadow_to_range_ratio"] > 0.2:
+            process_info.append(f"Ada penolakan kuat dari atas (upper shadow {props['upper_shadow_to_range_ratio']:.1%} dari range).")
+            implication_info.append("Implikasi: Menunjukkan tekanan jual kuat di harga tinggi, potensi kelanjutan turun.")
+        if props["lower_shadow_to_range_ratio"] > 0.2:
+            process_info.append(f"Ada penolakan dari bawah (lower shadow {props['lower_shadow_to_range_ratio']:.1%} dari range).")
+            implication_info.append("Implikasi: Menunjukkan tekanan beli di harga rendah, potensi pelemahan momentum turun.")
+        if props["body_to_range_ratio"] > 0.6:
+            implication_info.append("Implikasi: Momentum bearish kuat, berpotensi menjadi candle penentu tren.")
 
-        # Potensi Lanjut Bearish (strong body, small lower shadow)
-        if props["body_to_range_ratio"] > 0.6 and props["lower_shadow_to_range_ratio"] < 0.2:
-            additional_info.append("Potensi Lanjut: **Momentum Bearish kuat** berlanjut.")
-
-    else: # Doji-like atau body sangat kecil (current_price sangat dekat open_price)
-        process_info = "Proses: Harga bergerak bolak-balik, menunjukkan keraguan pasar."
+    else: # Doji-like atau body sangat kecil
+        process_info.append("Proses: Harga bergerak bolak-balik, menunjukkan keraguan pasar.")
         if props["upper_shadow_to_range_ratio"] > 0.2 and props["lower_shadow_to_range_ratio"] > 0.2:
-            additional_info.append("Kondisi: **Sideways/Indecision** (tekanan beli dan jual seimbang).")
+            implication_info.append("Implikasi: Ketidakpastian tinggi, pasar menunggu arah. Potensi konsolidasi atau pembalikan.")
         elif props["body_to_range_ratio"] < 0.1:
-            additional_info.append("Kondisi: **Keraguan/Konsolidasi** (pergerakan harga minimal).")
+            implication_info.append("Implikasi: Keraguan/konsolidasi. Pergerakan harga minimal, bisa jadi jeda sebelum pergerakan besar.")
 
-    final_message_parts = [potential_info, process_info]
-    if additional_info:
-        final_message_parts.append("Perhatian: " + " ".join(additional_info))
+    # 3. Analisis Volume (jika tersedia dan relevan untuk live candle)
+    # Anda bisa menambahkan logika volume di sini jika ingin menganalisis volume secara real-time
+    # Misalnya: if candle["volume"] > average_volume_for_this_period: implication_info.append("Didukung volume tinggi.")
 
-    return "💡 **Analisis Live Candle**: " + " ".join(final_message_parts)
+    # 4. Progres Waktu Candle
+    if time_progress < 0.3:
+        implication_info.append("Catatan: Candle masih di awal periode, bentuknya sangat fluktuatif.")
+    elif time_progress > 0.7:
+        implication_info.append("Catatan: Candle mendekati penutupan, bentuknya lebih representatif.")
 
+    final_message_parts = [
+        "💡 **Analisis Live Candle**:",
+        "   " + " ".join(potential_info),
+        "   " + " ".join(process_info)
+    ]
+    if implication_info:
+        final_message_parts.append("   " + " ".join(implication_info))
+
+    return "\n".join(final_message_parts)
 
 # --- MAIN LOGIC FOR PERIODIC SCAN ---
 def scan_all_intervals_and_notify():
@@ -560,7 +569,9 @@ def scan_all_intervals_and_notify():
         current_candles_for_analysis = list(_candle_data_cache.get(tf, []))
         live_candle_for_tf = _live_websocket_candle_data.get(tf)
 
+        time_progress_for_live_candle = 0.0
         if live_candle_for_tf:
+            time_progress_for_live_candle = get_time_progress(live_candle_for_tf["time"], tf)
             if not current_candles_for_analysis or \
                live_candle_for_tf["time"] > current_candles_for_analysis[-1]["time"]:
                 current_candles_for_analysis.append(live_candle_for_tf)
@@ -625,9 +636,8 @@ def scan_all_intervals_and_notify():
         )
 
         if not latest_candle["is_final_bar"]:
-            progress = get_time_progress(latest_candle["time"], tf)
-            time_progress_info = f" ({int(progress*100)}% progress)"
-            live_candle_potential_info_msg = get_live_candle_potential_and_process(latest_candle)
+            time_progress_info = f" ({int(time_progress_for_live_candle*100)}% progress)"
+            live_candle_potential_info_msg = get_live_candle_potential_and_process(latest_candle, time_progress_for_live_candle)
             
         tf_msg_part = f"\n---\n📊 **{tf.upper()} Timeframe** {status_candle_tag} ({status_candle_desc}{time_progress_info})\n" \
                       f"**Waktu Analisis**: {datetime.datetime.now(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
@@ -703,7 +713,6 @@ def scan_all_intervals_and_notify():
 def send_discord_alert(title: str, message: str):
     """Mengirim notifikasi ke Discord via webhook."""
     if DISCORD_WEBHOOK == "<YOUR_DISCORD_WEBHOOK_HERE>":
-        # Perbaikan syntax error di sini
         logger.error("DISCORD_WEBHOOK belum diatur. Tidak dapat mengirim notifikasi. Harap ganti placeholder URL.")
         return
 
