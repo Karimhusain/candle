@@ -24,7 +24,7 @@ CANDLE_LIMIT = { # Batas candle yang diambil untuk analisis per interval
 }
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1392182015884787832/OwTMcZHCnm7mB16c7ebATXzgNWe7QmiXtmKPBvVu7YpdRdzAXIHhqSqp8ou9moKg64Tm" # <<< PENTING: GANTI DENGAN URL WEBHOOK DISCORD ANDA
 
-# Frekuensi analisis real-time (dalam detik)
+# Frekuensi analisis real-time (dalam detik) untuk live candle dan fallback
 REAL_TIME_SCAN_INTERVAL_SECONDS = 30 * 60 # Setiap 30 menit
 
 # Base URL untuk WebSocket Binance (Production)
@@ -40,6 +40,9 @@ _candle_data_cache = {interval: [] for interval in INTERVALS}
 _live_websocket_candle_data = {interval: None for interval in INTERVALS}
 # Cache untuk menyimpan waktu penutupan candle terakhir yang sudah diproses secara final
 last_processed_final_candle_time = {interval: None for interval in INTERVALS}
+
+# Lock untuk mengakses _candle_data_cache agar aman dari race condition antara thread
+data_cache_lock = threading.Lock()
 
 # --- BINANCE KLINE API ---
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5), after=after_log(logger, logging.WARNING))
@@ -521,8 +524,8 @@ def get_multi_tf_confirmations(current_tf_patterns: list, all_tf_data: dict, cur
             
     return confirmations
 
-def get_live_candle_potential_and_process(candle: dict, time_progress: float) -> str:
-    """Menganalisis potensi awal dan proses perkembangan live candle dengan detail."""
+def get_live_candle_potential_and_process(candle: dict, time_progress: float, average_volume_prev_candles: float) -> str:
+    """Menganalisis potensi awal dan proses perkembangan live candle dengan detail, termasuk volume."""
     if candle["is_final_bar"]:
         return "" # Hanya berlaku untuk live candle
 
@@ -530,6 +533,7 @@ def get_live_candle_potential_and_process(candle: dict, time_progress: float) ->
     current_price = candle["close"]
     high_price = candle["high"]
     low_price = candle["low"]
+    current_volume = candle["volume"]
 
     props = get_candle_properties(candle)
 
@@ -575,9 +579,18 @@ def get_live_candle_potential_and_process(candle: dict, time_progress: float) ->
         elif props["body_to_range_ratio"] < 0.15: # Disesuaikan dengan is_doji_like
             implication_info.append("Implikasi: Keraguan/konsolidasi. Pergerakan harga minimal, bisa jadi jeda sebelum pergerakan besar.")
 
-    # 3. Analisis Volume (jika tersedia dan relevan untuk live candle)
-    # Anda bisa menambahkan logika volume di sini jika ingin menganalisis volume secara real-time
-    # Misalnya: if candle["volume"] > average_volume_for_this_period: implication_info.append("Didukung volume tinggi.")
+    # 3. Analisis Progres Volume
+    if average_volume_prev_candles > 0:
+        expected_volume_at_this_progress = average_volume_prev_candles * time_progress
+        if current_volume > expected_volume_at_this_progress * 1.2: # 20% di atas rata-rata yang diharapkan
+            implication_info.append(f"Volume saat ini `{current_volume:.2f}`: **Tinggi** (lebih dari 20% dari volume rata-rata yang diharapkan). Menunjukkan minat besar.")
+        elif current_volume < expected_volume_at_this_progress * 0.8: # 20% di bawah rata-rata yang diharapkan
+            implication_info.append(f"Volume saat ini `{current_volume:.2f}`: **Rendah** (kurang dari 20% dari volume rata-rata yang diharapkan). Menunjukkan kurangnya minat.")
+        else:
+            implication_info.append(f"Volume saat ini `{current_volume:.2f}`: **Normal** (sesuai ekspektasi berdasarkan progres waktu).")
+    else:
+        implication_info.append(f"Volume saat ini: `{current_volume:.2f}` (tidak ada data volume rata-rata historis untuk perbandingan).")
+
 
     # 4. Progres Waktu Candle
     if time_progress < 0.3:
@@ -591,183 +604,207 @@ def get_live_candle_potential_and_process(candle: dict, time_progress: float) ->
         "   " + " ".join(process_info)
     ]
     if implication_info:
-        final_message_parts.append("   " + " ".join(implication_info))
+        final_message_parts.append("   " + "\n   ".join(implication_info)) # Pisahkan implikasi dengan newline untuk readability
 
     return "\n".join(final_message_parts)
 
+def get_average_volume(candles: list, lookback_period: int = 20) -> float:
+    """Menghitung rata-rata volume dari beberapa candle terakhir."""
+    if len(candles) < lookback_period:
+        return 0.0
+    recent_volumes = [c["volume"] for c in candles[-lookback_period-1:-1]] # Ambil volume dari candle sebelumnya (tidak termasuk yang terakhir/live)
+    if not recent_volumes: return 0.0
+    return sum(recent_volumes) / len(recent_volumes)
+
 # --- MAIN LOGIC FOR PERIODIC SCAN ---
-def scan_all_intervals_and_notify():
+def scan_all_intervals_and_notify(triggered_by_websocket_tf: str = None):
     """
     Memindai dan melaporkan pola untuk semua interval yang dikonfigurasi.
     Menggunakan data historis yang di-cache + live candle dari WebSocket.
     Mengirim satu notifikasi Discord yang menggabungkan semua informasi.
+    
+    Args:
+        triggered_by_websocket_tf (str, optional): Timeframe yang memicu scan ini
+            karena candle-nya baru saja closed. None jika dipicu oleh timer.
     """
-    global _candle_data_cache, _live_websocket_candle_data
+    global _candle_data_cache, _live_websocket_candle_data, last_processed_final_candle_time
 
     full_alert_message_parts = []
     current_price = None # Akan diisi dari candle terbaru dari salah satu TF
 
-    for tf in INTERVALS:
-        # Prioritaskan live candle dari WebSocket jika ada dan belum final
-        latest_candle = _live_websocket_candle_data.get(tf)
-        is_live_candle_being_processed = False
+    with data_cache_lock: # Pastikan akses ke cache aman
+        for tf in INTERVALS:
+            # Prioritaskan live candle dari WebSocket jika ada dan belum final
+            latest_candle = _live_websocket_candle_data.get(tf)
+            is_live_candle_being_processed = False
 
-        if latest_candle and not latest_candle["is_final_bar"]:
-            # Gunakan live candle untuk analisis
-            current_candles_for_analysis = list(_candle_data_cache.get(tf, []))
-            # Pastikan live candle ada di akhir list untuk analisis
-            if not current_candles_for_analysis or latest_candle["time"] > current_candles_for_analysis[-1]["time"]:
-                current_candles_for_analysis.append(latest_candle)
-            elif current_candles_for_analysis and latest_candle["time"] == current_candles_for_analysis[-1]["time"]:
-                current_candles_for_analysis[-1] = latest_candle # Update jika sudah ada tapi belum final
-            
-            is_live_candle_being_processed = True
-        else:
-            # Jika tidak ada live candle, atau live candle sudah final (misal baru saja close),
-            # gunakan candle terakhir dari cache historis
-            current_candles_for_analysis = list(_candle_data_cache.get(tf, []))
-            if current_candles_for_analysis:
-                latest_candle = current_candles_for_analysis[-1]
+            if latest_candle and not latest_candle["is_final_bar"]:
+                # Gunakan live candle untuk analisis
+                current_candles_for_analysis = list(_candle_data_cache.get(tf, []))
+                # Pastikan live candle ada di akhir list untuk analisis
+                if not current_candles_for_analysis or latest_candle["time"] > current_candles_for_analysis[-1]["time"]:
+                    current_candles_for_analysis.append(latest_candle)
+                elif current_candles_for_analysis and latest_candle["time"] == current_candles_for_analysis[-1]["time"]:
+                    current_candles_for_analysis[-1] = latest_candle # Update jika sudah ada tapi belum final
+                
+                is_live_candle_being_processed = True
             else:
-                latest_candle = None # Tidak ada data sama sekali
-
-        if not latest_candle:
-            full_alert_message_parts.append(f"\n---\n📊 **{tf.upper()} Timeframe**: Tidak ada data candle tersedia.")
-            continue
-            
-        time_progress_for_live_candle = 0.0
-        if is_live_candle_being_processed: # Hanya hitung progress jika memang ini live candle
-             time_progress_for_live_candle = get_time_progress(latest_candle["time"], tf)
-        
-        # Menyesuaikan kebutuhan minimum candle berdasarkan jenis analisis
-        # ... (Logika min_candles_needed tetap sama) ...
-        min_candles_needed = 3 # Default untuk PA dasar (1-3 candle)
-        if tf == "1d" and CANDLE_LIMIT[tf] >= 300: # Untuk deteksi chart pattern 1D yang butuh banyak data
-             min_candles_needed = 100 
-        elif tf in ["1h", "4h"] and CANDLE_LIMIT[tf] >= 150: # Untuk deteksi SMC/SR yang butuh puluhan candle
-             min_candles_needed = 50
-
-        if len(current_candles_for_analysis) < min_candles_needed:
-            full_alert_message_parts.append(f"\n---\n📊 **{tf.upper()} Timeframe**: Tidak cukup data untuk analisis lengkap. ({len(current_candles_for_analysis)}/{min_candles_needed} candles dibutuhkan)")
-            continue
-
-
-        # latest_candle sudah ditentukan di atas
-        if current_price is None:
-            current_price = latest_candle['close']
-
-        pa_patterns = detect_price_action(current_candles_for_analysis, enable_volume_confirmation=False)
-        cp_patterns = detect_chart_patterns(current_candles_for_analysis)
-        bos_choch_patterns = detect_bos_choch(current_candles_for_analysis)
-        sr_levels = detect_auto_sr(current_candles_for_analysis)
-
-        # Temp all tf data for multi-tf (pastikan ini juga pakai live candle jika tersedia)
-        temp_all_tf_data_for_multi_tf = {}
-        for _tf_check in INTERVALS:
-            _temp_live_c = _live_websocket_candle_data.get(_tf_check)
-            if _temp_live_c and not _temp_live_c["is_final_bar"]:
-                _temp_candles = list(_candle_data_cache.get(_tf_check, []))
-                if not _temp_candles or _temp_live_c["time"] > _temp_candles[-1]["time"]:
-                    _temp_candles.append(_temp_live_c)
-                elif _temp_candles and _temp_live_c["time"] == _temp_candles[-1]["time"]:
-                    _temp_candles[-1] = _temp_live_c # Update live candle in temp list
-                temp_all_tf_data_for_multi_tf[_tf_check] = _temp_candles
-            else:
-                temp_all_tf_data_for_multi_tf[_tf_check] = list(_candle_data_cache.get(_tf_check, [])) # Gunakan cache jika tidak ada live/sudah final
-
-
-        multi_tf_confirmations = get_multi_tf_confirmations(pa_patterns + cp_patterns + bos_choch_patterns, temp_all_tf_data_for_multi_tf, tf)
-
-        props = get_candle_properties(latest_candle)
-        candle_type = "Bullish" if props["is_bullish"] else "Bearish" if props["is_bearish"] else "Doji-like"
-        full_range_percent = (props["full_range"] / latest_candle["open"]) * 100 if latest_candle["open"] else 0
-        
-        status_candle_tag = "[L]" if is_live_candle_being_processed else "[C]" # Ditentukan oleh is_live_candle_being_processed
-        status_candle_desc = "LIVE (Open)" if is_live_candle_being_processed else "FINAL (Closed)" # Ditentukan oleh is_live_candle_being_processed
-        time_progress_info = ""
-        live_candle_potential_info_msg = ""
-
-        # Detail candle (akan selalu ditampilkan untuk final/live)
-        candle_details = (
-            f"   • Open: `{latest_candle['open']:.2f}`\n"
-            f"   • High: `{latest_candle['high']:.2f}`\n"
-            f"   • Low: `{latest_candle['low']:.2f}`\n"
-            f"   • Close: `{latest_candle['close']:.2f}`\n"
-            f"   • Volume: `{latest_candle['volume']:.2f}`\n"
-            f"   • Body/Range Ratio: `{props['body_to_range_ratio']:.2f}`\n"
-            f"   • Upper Shadow/Range Ratio: `{props['upper_shadow_to_range_ratio']:.2f}`\n"
-            f"   • Lower Shadow/Range Ratio: `{props['lower_shadow_to_range_ratio']:.2f}`\n"
-        )
-
-        if is_live_candle_being_processed: # Hanya tambahkan info progress jika ini live candle
-            time_progress_info = f" ({int(time_progress_for_live_candle*100)}% progress)"
-            live_candle_potential_info_msg = get_live_candle_potential_and_process(latest_candle, time_progress_for_live_candle)
-            
-        tf_msg_part = f"\n---\n📊 **{tf.upper()} Timeframe** {status_candle_tag} ({status_candle_desc}{time_progress_info})\n" \
-                      f"**Waktu Analisis**: {datetime.datetime.now(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
-        
-        if status_candle_tag == "[C]": # Jika itu candle yang sudah tertutup
-            tf_msg_part += f"**Waktu Penutupan Candle Sebelumnya**: {latest_candle['close_time'].astimezone(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
-        else: # Jika itu candle live
-            tf_msg_part += f"Waktu Pembukaan Candle: {latest_candle['time'].astimezone(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
-
-
-        tf_msg_part += f"Tipe Candle: {candle_type} (Range: {full_range_percent:.2f}%)\n" \
-                       f"**Detail Candle (O/H/L/C)**:\n{candle_details}" + \
-                       (live_candle_potential_info_msg + "\n" if live_candle_potential_info_msg else "") # Tambah newline jika ada info live
-
-        detected_info_present = False
-        
-        # ... (sisa logika deteksi pola dan S/R tetap sama) ...
-        if pa_patterns: 
-            tf_msg_part += "🕯️ **Pola Candlestick**: " + ", ".join(pa_patterns) + "\n"
-            detected_info_present = True
-        
-        if cp_patterns:
-            cp_descriptions = []
-            for pattern in cp_patterns:
-                if "Double Top" in pattern:
-                    cp_descriptions.append(f"**Double Top**: Menunjukkan potensi pembalikan tren dari naik menjadi turun.")
-                elif "Double Bottom" in pattern:
-                    cp_descriptions.append(f"**Double Bottom**: Menunjukkan potensi pembalikan tren dari turun menjadi naik.")
-                elif "Head & Shoulders" in pattern:
-                    cp_descriptions.append(f"**Head & Shoulders**: Menunjukkan potensi pembalikan tren dari naik menjadi turun.")
-                elif "Inverse Head & Shoulders" in pattern:
-                    cp_descriptions.append(f"**Inverse Head & Shoulders**: Menunjukkan potensi pembalikan tren dari turun menjadi naik.")
+                # Jika tidak ada live candle, atau live candle sudah final (misal baru saja close),
+                # gunakan candle terakhir dari cache historis
+                current_candles_for_analysis = list(_candle_data_cache.get(tf, []))
+                if current_candles_for_analysis:
+                    latest_candle = current_candles_for_analysis[-1]
                 else:
-                    cp_descriptions.append(pattern)
-            tf_msg_part += "📈 **Pola Chart**: " + "\n" + "\n".join([f"- {desc}" for desc in cp_descriptions]) + "\n"
-            detected_info_present = True
+                    latest_candle = None # Tidak ada data sama sekali
 
-        if bos_choch_patterns: 
-            tf_msg_part += "🔄 **Struktur Pasar (SMC)**: " + ", ".join(bos_choch_patterns) + "\n"
-            detected_info_present = True
-        
-        sr_info_part = ""
-        if sr_levels.get("support"): 
-            sr_info_part += "⬇️ **Support Levels**: " + ", ".join([f"{v:.2f}" for v in sr_levels["support"]]) + "\n"
-            detected_info_present = True
-            for s_level in sr_levels["support"]:
-                if abs(current_price - s_level) / current_price < 0.005: # Dalam 0.5% dari S/R level
-                    sr_info_part += f"⚠️ Harga saat ini ({current_price:.2f}) mendekati Support Level {s_level:.2f}\n"
+            # Cek apakah notifikasi untuk candle final TF ini sudah dikirim dalam sesi ini
+            if not is_live_candle_being_processed and latest_candle and \
+               latest_candle["is_final_bar"] and \
+               last_processed_final_candle_time[tf] == latest_candle["close_time"] and \
+               tf != triggered_by_websocket_tf: # Jangan skip jika ini TF yang baru closed dan trigger scan
+                # Logger.info(f"Skipping {tf} analysis. Final candle already processed or not the trigger.")
+                continue # Skip jika sudah diproses, kecuali jika ini TF yang baru memicu notifikasi
 
-        if sr_levels.get("resistance"): 
-            sr_info_part += "⬆️ **Resistance Levels**: " + ", ".join([f"{v:.2f}" for v in sr_levels["resistance"]]) + "\n"
-            detected_info_present = True
-            for r_level in sr_levels["resistance"]:
-                if abs(current_price - r_level) / current_price < 0.005: # Dalam 0.5% dari S/R level
-                    sr_info_part += f"⚠️ Harga saat ini ({current_price:.2f}) mendekati Resistance Level {r_level:.2f}\n"
-        tf_msg_part += sr_info_part
+            if not latest_candle:
+                full_alert_message_parts.append(f"\n---\n📊 **{tf.upper()} Timeframe**: Tidak ada data candle tersedia.")
+                continue
+                
+            time_progress_for_live_candle = 0.0
+            average_volume_past = get_average_volume(current_candles_for_analysis)
 
-        if multi_tf_confirmations: 
-            tf_msg_part += "✅ **Konfirmasi Multi-TF**: " + ", ".join(multi_tf_confirmations) + "\n"
-            detected_info_present = True
-        
-        # Diperbarui: Hanya tampilkan ini jika TIDAK ADA informasi yang terdeteksi sama sekali ATAU tidak ada info live
-        if not detected_info_present and not live_candle_potential_info_msg: 
-            tf_msg_part += "Tidak ada pola atau informasi signifikan terdeteksi saat ini.\n"
+            if is_live_candle_being_processed: # Hanya hitung progress jika memang ini live candle
+                time_progress_for_live_candle = get_time_progress(latest_candle["time"], tf)
+            
+            # Menyesuaikan kebutuhan minimum candle berdasarkan jenis analisis
+            min_candles_needed = 3 # Default untuk PA dasar (1-3 candle)
+            if tf == "1d" and CANDLE_LIMIT[tf] >= 300: # Untuk deteksi chart pattern 1D yang butuh banyak data
+                min_candles_needed = 100 
+            elif tf in ["1h", "4h"] and CANDLE_LIMIT[tf] >= 150: # Untuk deteksi SMC/SR yang butuh puluhan candle
+                min_candles_needed = 50
 
-        full_alert_message_parts.append(tf_msg_part)
+            if len(current_candles_for_analysis) < min_candles_needed:
+                full_alert_message_parts.append(f"\n---\n📊 **{tf.upper()} Timeframe**: Tidak cukup data untuk analisis lengkap. ({len(current_candles_for_analysis)}/{min_candles_needed} candles dibutuhkan)")
+                continue
+
+            # latest_candle sudah ditentukan di atas
+            if current_price is None:
+                current_price = latest_candle['close']
+
+            pa_patterns = detect_price_action(current_candles_for_analysis, enable_volume_confirmation=False)
+            cp_patterns = detect_chart_patterns(current_candles_for_analysis)
+            bos_choch_patterns = detect_bos_choch(current_candles_for_analysis)
+            sr_levels = detect_auto_sr(current_candles_for_analysis)
+
+            # Temp all tf data for multi-tf (pastikan ini juga pakai live candle jika tersedia)
+            temp_all_tf_data_for_multi_tf = {}
+            for _tf_check in INTERVALS:
+                _temp_live_c = _live_websocket_candle_data.get(_tf_check)
+                if _temp_live_c and not _temp_live_c["is_final_bar"]:
+                    _temp_candles = list(_candle_data_cache.get(_tf_check, []))
+                    if not _temp_candles or _temp_live_c["time"] > _temp_candles[-1]["time"]:
+                        _temp_candles.append(_temp_live_c)
+                    elif _temp_candles and _temp_live_c["time"] == _temp_candles[-1]["time"]:
+                        _temp_candles[-1] = _temp_live_c # Update live candle in temp list
+                    temp_all_tf_data_for_multi_tf[_tf_check] = _temp_candles
+                else:
+                    temp_all_tf_data_for_multi_tf[_tf_check] = list(_candle_data_cache.get(_tf_check, [])) # Gunakan cache jika tidak ada live/sudah final
+
+
+            multi_tf_confirmations = get_multi_tf_confirmations(pa_patterns + cp_patterns + bos_choch_patterns, temp_all_tf_data_for_multi_tf, tf)
+
+            props = get_candle_properties(latest_candle)
+            candle_type = "Bullish" if props["is_bullish"] else "Bearish" if props["is_bearish"] else "Doji-like"
+            full_range_percent = (props["full_range"] / latest_candle["open"]) * 100 if latest_candle["open"] else 0
+            
+            status_candle_tag = "[L]" if is_live_candle_being_processed else "[C]" # Ditentukan oleh is_live_candle_being_processed
+            status_candle_desc = "LIVE (Open)" if is_live_candle_being_processed else "FINAL (Closed)" # Ditentukan oleh is_live_candle_being_processed
+            time_progress_info = ""
+            live_candle_potential_info_msg = ""
+
+            # Detail candle (akan selalu ditampilkan untuk final/live)
+            candle_details = (
+                f"   • Open: `{latest_candle['open']:.2f}`\n"
+                f"   • High: `{latest_candle['high']:.2f}`\n"
+                f"   • Low: `{latest_candle['low']:.2f}`\n"
+                f"   • Close: `{latest_candle['close']:.2f}`\n"
+                f"   • Volume: `{latest_candle['volume']:.2f}`\n"
+                f"   • Body/Range Ratio: `{props['body_to_range_ratio']:.2f}`\n"
+                f"   • Upper Shadow/Range Ratio: `{props['upper_shadow_to_range_ratio']:.2f}`\n"
+                f"   • Lower Shadow/Range Ratio: `{props['lower_shadow_to_range_ratio']:.2f}`\n"
+            )
+
+            if is_live_candle_being_processed: # Hanya tambahkan info progress jika ini live candle
+                time_progress_info = f" ({int(time_progress_for_live_candle*100)}% progress)"
+                live_candle_potential_info_msg = get_live_candle_potential_and_process(latest_candle, time_progress_for_live_candle, average_volume_past)
+                
+            tf_msg_part = f"\n---\n📊 **{tf.upper()} Timeframe** {status_candle_tag} ({status_candle_desc}{time_progress_info})\n" \
+                        f"**Waktu Analisis**: {datetime.datetime.now(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
+            
+            if status_candle_tag == "[C]": # Jika itu candle yang sudah tertutup
+                tf_msg_part += f"**Waktu Penutupan Candle**: {latest_candle['close_time'].astimezone(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
+            else: # Jika itu candle live
+                tf_msg_part += f"Waktu Pembukaan Candle: {latest_candle['time'].astimezone(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
+
+
+            tf_msg_part += f"Tipe Candle: {candle_type} (Range: {full_range_percent:.2f}%)\n" \
+                        f"**Detail Candle (O/H/L/C)**:\n{candle_details}" + \
+                        (live_candle_potential_info_msg + "\n" if live_candle_potential_info_msg else "") # Tambah newline jika ada info live
+
+            detected_info_present = False
+            
+            if pa_patterns: 
+                tf_msg_part += "🕯️ **Pola Candlestick**: " + ", ".join(pa_patterns) + "\n"
+                detected_info_present = True
+            
+            if cp_patterns:
+                cp_descriptions = []
+                for pattern in cp_patterns:
+                    if "Double Top" in pattern:
+                        cp_descriptions.append(f"**Double Top**: Menunjukkan potensi pembalikan tren dari naik menjadi turun.")
+                    elif "Double Bottom" in pattern:
+                        cp_descriptions.append(f"**Double Bottom**: Menunjukkan potensi pembalikan tren dari turun menjadi naik.")
+                    elif "Head & Shoulders" in pattern:
+                        cp_descriptions.append(f"**Head & Shoulders**: Menunjukkan potensi pembalikan tren dari naik menjadi turun.")
+                    elif "Inverse Head & Shoulders" in pattern:
+                        cp_descriptions.append(f"**Inverse Head & Shoulders**: Menunjukkan potensi pembalikan tren dari turun menjadi naik.")
+                    else:
+                        cp_descriptions.append(pattern)
+                tf_msg_part += "📈 **Pola Chart**: " + "\n" + "\n".join([f"- {desc}" for desc in cp_descriptions]) + "\n"
+                detected_info_present = True
+
+            if bos_choch_patterns: 
+                tf_msg_part += "🔄 **Struktur Pasar (SMC)**: " + ", ".join(bos_choch_patterns) + "\n"
+                detected_info_present = True
+            
+            sr_info_part = ""
+            if sr_levels.get("support"): 
+                sr_info_part += "⬇️ **Support Levels**: " + ", ".join([f"{v:.2f}" for v in sr_levels["support"]]) + "\n"
+                detected_info_present = True
+                for s_level in sr_levels["support"]:
+                    if abs(current_price - s_level) / current_price < 0.005: # Dalam 0.5% dari S/R level
+                        sr_info_part += f"⚠️ Harga saat ini ({current_price:.2f}) mendekati Support Level {s_level:.2f}\n"
+
+            if sr_levels.get("resistance"): 
+                sr_info_part += "⬆️ **Resistance Levels**: " + ", ".join([f"{v:.2f}" for v in sr_levels["resistance"]]) + "\n"
+                detected_info_present = True
+                for r_level in sr_levels["resistance"]:
+                    if abs(current_price - r_level) / current_price < 0.005: # Dalam 0.5% dari S/R level
+                        sr_info_part += f"⚠️ Harga saat ini ({current_price:.2f}) mendekati Resistance Level {r_level:.2f}\n"
+            tf_msg_part += sr_info_part
+
+            if multi_tf_confirmations: 
+                tf_msg_part += "✅ **Konfirmasi Multi-TF**: " + ", ".join(multi_tf_confirmations) + "\n"
+                detected_info_present = True
+            
+            # Diperbarui: Hanya tampilkan ini jika TIDAK ADA informasi yang terdeteksi sama sekali ATAU tidak ada info live
+            if not detected_info_present and not live_candle_potential_info_msg: 
+                tf_msg_part += "Tidak ada pola atau informasi signifikan terdeteksi saat ini.\n"
+
+            full_alert_message_parts.append(tf_msg_part)
+
+            # Tandai candle ini sudah diproses jika ini adalah candle final yang memicu notifikasi
+            if not is_live_candle_being_processed and latest_candle["is_final_bar"] and tf == triggered_by_websocket_tf:
+                last_processed_final_candle_time[tf] = latest_candle["close_time"]
 
     if full_alert_message_parts:
         header_price = f"**Harga Terakhir {SYMBOL}**: {current_price:.2f}\n" if current_price else ""
@@ -776,39 +813,11 @@ def scan_all_intervals_and_notify():
     else:
         logger.info("Tidak ada update yang signifikan untuk dikirim dalam ringkasan real-time.")
 
-        # Detail candle (akan selalu ditampilkan untuk final/live)
-        candle_details = (
-            f"   • Open: `{latest_candle['open']:.2f}`\n"
-            f"   • High: `{latest_candle['high']:.2f}`\n"
-            f"   • Low: `{latest_candle['low']:.2f}`\n"
-            f"   • Close: `{latest_candle['close']:.2f}`\n"
-            f"   • Volume: `{latest_candle['volume']:.2f}`\n"
-            f"   • Body/Range Ratio: `{props['body_to_range_ratio']:.2f}`\n"
-            f"   • Upper Shadow/Range Ratio: `{props['upper_shadow_to_range_ratio']:.2f}`\n"
-            f"   • Lower Shadow/Range Ratio: `{props['lower_shadow_to_range_ratio']:.2f}`\n"
-        )
-
-        if not latest_candle["is_final_bar"]:
-            time_progress_info = f" ({int(time_progress_for_live_candle*100)}% progress)"
-            live_candle_potential_info_msg = get_live_candle_potential_and_process(latest_candle, time_progress_for_live_candle)
-            
-        tf_msg_part = f"\n---\n📊 **{tf.upper()} Timeframe** {status_candle_tag} ({status_candle_desc}{time_progress_info})\n" \
-                      f"**Waktu Analisis**: {datetime.datetime.now(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
-        
-        if latest_candle["is_final_bar"]:
-            tf_msg_part += f"**Waktu Penutupan Candle Sebelumnya**: {latest_candle['close_time'].astimezone(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
-        else:
-            tf_msg_part += f"Waktu Pembukaan Candle: {latest_candle['time'].astimezone(TARGET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
-
-
-        tf_msg_part += f"Tipe Candle: {candle_type} (Range: {full_range_percent:.2f}%)\n" \
-                       f"**Detail Candle (O/H/L/C)**:\n{candle_details}" + \
-                       (live_candle_potential_info_msg + "\n" if live_candle_potential_info_msg else "") # Tambah newline jika ada info live
 
 # --- DISCORD ALERT ---
 def send_discord_alert(title: str, message: str):
     """Mengirim notifikasi ke Discord via webhook."""
-    if DISCORD_WEBHOOK == "<YOUR_DISCORD_WEBHOOK_HERE>":
+    if DISCORD_WEBHOOK == "https://discord.com/api/webhooks/1392182015884787832/OwTMcZHCnm7mB16c7ebATXzgNWe7QmiXtmKPBvVu7YpdRdzAXIHhqSqp8ou9moKg64Tm": # Masih pakai placeholder lama, bisa jadi lupa diganti
         logger.error("DISCORD_WEBHOOK belum diatur. Tidak dapat mengirim notifikasi. Harap ganti placeholder URL.")
         return
 
@@ -859,15 +868,23 @@ def on_message(ws, message):
             "is_final_bar": kline_data["x"] # 'x' indicates if this candle is closed
         }
         
-        _live_websocket_candle_data[interval] = current_candle
+        with data_cache_lock: # Amankan akses ke cache saat update
+            _live_websocket_candle_data[interval] = current_candle
 
-        if current_candle["is_final_bar"] and \
-           (last_processed_final_candle_time[interval] is None or \
-            current_candle["close_time"] > last_processed_final_candle_time[interval]):
-            
-            logger.info(f"[{interval.upper()}] Candle DITUTUP (FINAL). Memperbarui data historis dari REST API.")
-            _candle_data_cache[interval] = get_klines_rest(SYMBOL, interval, CANDLE_LIMIT[interval])
-            last_processed_final_candle_time[interval] = current_candle["close_time"]
+            if current_candle["is_final_bar"]:
+                # Periksa apakah candle ini sudah pernah diproses sebagai final
+                if last_processed_final_candle_time[interval] is None or \
+                current_candle["close_time"] > last_processed_final_candle_time[interval]:
+                    
+                    logger.info(f"[{interval.upper()}] Candle DITUTUP (FINAL). Memperbarui data historis dari REST API dan memicu scan.")
+                    # Perbarui cache historis dengan data REST API untuk keakuratan
+                    _candle_data_cache[interval] = get_klines_rest(SYMBOL, interval, CANDLE_LIMIT[interval])
+                    # PENTING: Panggil scan_all_intervals_and_notify dengan parameter agar tahu TF mana yang trigger
+                    threading.Thread(target=scan_all_intervals_and_notify, args=(interval,)).start()
+                else:
+                    logger.debug(f"[{interval.upper()}] Candle FINAL diterima tetapi sudah diproses sebelumnya.")
+            else:
+                logger.debug(f"[{interval.upper()}] Candle LIVE diperbarui. Harga: {current_candle['close']:.2f}, Volume: {current_candle['volume']:.2f}")
 
     elif "result" in data:
         logger.info(f"WebSocket result: {data}")
@@ -891,45 +908,47 @@ def run_websocket_client():
         on_error=on_error,
         on_close=on_close
     )
-    ws_app.run_forever(ping_interval=30, ping_timeout=10)
+    # Ping interval lebih rendah untuk memastikan koneksi tetap hidup
+    ws_app.run_forever(ping_interval=20, ping_timeout=10)
 
 # --- RUNNER ---
 if __name__ == "__main__":
-    if DISCORD_WEBHOOK == "<YOUR_DISCORD_WEBHOOK_HERE>":
+    # Penting: Periksa placeholder webhook
+    if DISCORD_WEBHOOK == "https://discord.com/api/webhooks/1392182015884787832/OwTMcZHCnm7mB16c7ebATXzgNWe7QmiXtmKPBvVu7YpdRdzAXIHhqSqp8ou9moKg64Tm":
         logger.error("ERROR: Variabel DISCORD_WEBHOOK belum diatur. Harap ganti placeholder dengan URL webhook Anda di awal skrip.")
         exit(1)
         
     logger.info("Bot pemantau harga dimulai. Mengambil data historis awal...")
     
-    for tf in INTERVALS:
-        try:
-            initial_candles = get_klines_rest(SYMBOL, tf, CANDLE_LIMIT[tf])
-            if initial_candles:
-                _candle_data_cache[tf] = initial_candles
-                last_processed_final_candle_time[tf] = initial_candles[-1]["close_time"]
-                logger.info(f"Data historis {tf.upper()} berhasil dimuat. {len(initial_candles)} candle.")
-            else:
-                logger.error(f"Gagal memuat data historis untuk {tf}. Bot mungkin tidak berfungsi dengan baik.")
+    with data_cache_lock: # Kunci saat inisialisasi cache
+        for tf in INTERVALS:
+            try:
+                initial_candles = get_klines_rest(SYMBOL, tf, CANDLE_LIMIT[tf])
+                if initial_candles:
+                    _candle_data_cache[tf] = initial_candles
+                    last_processed_final_candle_time[tf] = initial_candles[-1]["close_time"]
+                    logger.info(f"Data historis {tf.upper()} berhasil dimuat. {len(initial_candles)} candle.")
+                else:
+                    logger.error(f"Gagal memuat data historis untuk {tf}. Bot mungkin tidak berfungsi dengan baik.")
+                    exit(1)
+            except Exception as e:
+                logger.error(f"Kesalahan fatal saat memuat data awal untuk {tf}: {e}. Memastikan ada koneksi internet.")
                 exit(1)
-        except Exception as e:
-            logger.error(f"Kesalahan fatal saat memuat data awal untuk {tf}: {e}. Memastikan ada koneksi internet.")
-            exit(1)
 
     logger.info("Memulai koneksi WebSocket untuk pembaruan real-time...")
     
     ws_thread = threading.Thread(target=run_websocket_client)
-    ws_thread.daemon = True
+    ws_thread.daemon = True # Daemon thread akan berhenti ketika program utama berhenti
     ws_thread.start()
 
-    logger.info("Memberi sedikit waktu untuk WebSocket terhubung dan menerima data live pertama...")
+    logger.info("Memberi sedikit waktu untuk WebSocket terhubung dan menerima data live pertama.")
     time.sleep(5)
 
     logger.info("Memicu analisis awal dan mengirim notifikasi Discord pertama.")
-    scan_all_intervals_and_notify()
+    scan_all_intervals_and_notify() # Panggil tanpa trigger_tf untuk inisialisasi
 
-    logger.info(f"Memulai loop analisis gabungan semua time-frame setiap {REAL_TIME_SCAN_INTERVAL_SECONDS / 60} menit (24/7).")
+    logger.info(f"Memulai loop analisis cadangan dan live candle setiap {REAL_TIME_SCAN_INTERVAL_SECONDS / 60} menit.")
     while True:
         time.sleep(REAL_TIME_SCAN_INTERVAL_SECONDS)
-        logger.info(f"Memicu analisis real-time semua time-frame pada interval {REAL_TIME_SCAN_INTERVAL_SECONDS / 60} menit.")
-        scan_all_intervals_and_notify()
-
+        logger.info(f"Memicu analisis live candle dan cadangan pada interval {REAL_TIME_SCAN_INTERVAL_SECONDS / 60} menit.")
+        scan_all_intervals_and_notify() # Panggil tanpa trigger_tf untuk scan berkala
