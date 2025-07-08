@@ -22,7 +22,7 @@ CANDLE_LIMIT = { # Batas candle yang diambil untuk analisis per interval
     "4h": 150,
     "1d": 100
 }
-DISCORD_WEBHOOK = "<YOUR_DISCORD_WEBHOOK_HERE>" # <<< PENTING: GANTI DENGAN URL WEBHOOK DISCORD ANDA
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1392182015884787832/OwTMcZHCnm7mB16c7ebATXzgNWe7QmiXtmKPBvVu7YpdRdzAXIHhqSqp8ou9moKg64Tm" # <<< PENTING: GANTI DENGAN URL WEBHOOK DISCORD ANDA
 
 # Frekuensi analisis real-time (dalam detik)
 REAL_TIME_SCAN_INTERVAL_SECONDS = 30 * 60 # Setiap 30 menit
